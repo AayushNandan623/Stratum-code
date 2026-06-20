@@ -24,6 +24,12 @@ type Config struct {
 	Env string
 	// EncryptionKey is the hex-encoded 32-byte key used for secret encryption.
 	EncryptionKey string
+	// JWTSecret is the HMAC key used to sign and verify JWT session tokens.
+	JWTSecret string
+	// WebhookSecret is the shared secret used to validate VCS webhook
+	// signatures. Phase 1 uses a single global secret; per-connection secrets
+	// arrive with the connection schema extension in a later phase.
+	WebhookSecret string
 }
 
 // Load reads configuration from the environment, applies defaults, and
@@ -36,6 +42,8 @@ func Load() (Config, error) {
 		LogLevel:      strings.ToLower(getenvDefault("STRATUM_LOG_LEVEL", "info")),
 		Env:           strings.ToLower(getenvDefault("STRATUM_ENV", "development")),
 		EncryptionKey: os.Getenv("STRATUM_ENCRYPTION_KEY"),
+		JWTSecret:     os.Getenv("STRATUM_JWT_SECRET"),
+		WebhookSecret: getenvDefault("STRATUM_WEBHOOK_SECRET", os.Getenv("STRATUM_WORKER_HMAC_SECRET")),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -65,6 +73,12 @@ func (c Config) validate() error {
 	}
 	if _, err := strconv.Atoi(c.HTTPPort); err != nil {
 		return fmt.Errorf("config: STRATUM_HTTP_PORT must be numeric, got %q", c.HTTPPort)
+	}
+	if c.JWTSecret == "" {
+		return fmt.Errorf("config: STRATUM_JWT_SECRET is required")
+	}
+	if c.WebhookSecret == "" {
+		return fmt.Errorf("config: STRATUM_WEBHOOK_SECRET (or STRATUM_WORKER_HMAC_SECRET) is required")
 	}
 	return nil
 }

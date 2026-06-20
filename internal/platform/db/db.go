@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	pgxuuid "github.com/vgarvardt/pgx-google-uuid/v5"
 )
 
 // DBTX is the minimal interface satisfied by both *pgxpool.Pool and pgx.Tx.
@@ -38,7 +39,17 @@ type DB struct {
 // New creates a connection pool against dbURL, pings it to verify
 // connectivity, and returns a ready DB. The caller must call Close on shutdown.
 func New(ctx context.Context, dbURL string) (*DB, error) {
-	pool, err := pgxpool.New(ctx, dbURL)
+	config, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		return nil, fmt.Errorf("db.New: parse config: %w", err)
+	}
+	// Register the google/uuid codec so repositories can scan uuid columns
+	// directly into uuid.UUID without per-query conversion.
+	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		pgxuuid.Register(conn.TypeMap())
+		return nil
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("db.New: create pool: %w", err)
 	}

@@ -15,10 +15,15 @@ import (
 	"time"
 
 	"github.com/yourorg/stratum/internal/api"
+	"github.com/yourorg/stratum/internal/iam"
 	"github.com/yourorg/stratum/internal/platform/config"
 	"github.com/yourorg/stratum/internal/platform/db"
 	"github.com/yourorg/stratum/internal/platform/logger"
 	"github.com/yourorg/stratum/internal/platform/telemetry"
+	"github.com/yourorg/stratum/internal/secret"
+	"github.com/yourorg/stratum/internal/stack"
+	"github.com/yourorg/stratum/internal/state"
+	"github.com/yourorg/stratum/internal/vcs"
 )
 
 // Version and Commit are injected at build time via -ldflags.
@@ -72,8 +77,27 @@ func main() {
 	defer database.Close()
 	log.Info("database connected")
 
+	// Bounded-context services.
+	crypto, err := secret.NewCrypto(cfg.EncryptionKey)
+	if err != nil {
+		log.Error("secret crypto init failed", "error", err)
+		os.Exit(1)
+	}
+	iamSvc := iam.NewService(database, cfg.JWTSecret)
+	stackSvc := stack.NewService(database)
+	secretSvc := secret.NewService(database, crypto)
+	stateSvc := state.NewService(database)
+	vcsSvc := vcs.NewService(database, cfg.WebhookSecret, log)
+
 	// HTTP server.
-	router := api.NewRouter()
+	router := api.NewRouter(api.Deps{
+		IAMSvc:    iamSvc,
+		StackSvc:  stackSvc,
+		SecretSvc: secretSvc,
+		StateSvc:  stateSvc,
+		VCSSvc:    vcsSvc,
+		Logger:    log,
+	})
 	srv := api.New(":"+cfg.HTTPPort, router, log)
 
 	// Run the server in a goroutine so the main goroutine can wait on signals.
