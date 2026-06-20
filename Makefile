@@ -77,7 +77,7 @@ dev-setup: ## One-command local setup: start deps, migrate, seed
 	@echo "Starting development dependencies..."
 	docker compose -f deploy/docker-compose.yml up -d
 	@echo "Waiting for PostgreSQL..."
-	@until pg_isready -h localhost -p 5432 -U stratum > /dev/null 2>&1; do sleep 1; done
+	@until docker compose -f deploy/docker-compose.yml exec -T postgres pg_isready -U stratum -d stratum > /dev/null 2>&1; do sleep 1; done
 	@echo "PostgreSQL ready."
 	@$(MAKE) migrate
 	@$(MAKE) seed
@@ -93,8 +93,8 @@ dev-up: ## Start background services (PostgreSQL, NATS)
 dev-down: ## Stop and remove background services
 	docker compose -f deploy/docker-compose.yml down
 
-seed: ## Insert development seed data (org, user, stack)
-	$(GO) run ./scripts/seed
+seed: ## Insert development seed data (org, user, stack) — Phase 0: not yet implemented
+	@echo "Phase 0: seed not implemented (no business logic in foundation phase)."
 
 run-server: ## Run the control plane server (requires dev-setup)
 	@[ -f .env ] && export $$(cat .env | xargs) ; $(GO) run ./cmd/stratum-server
