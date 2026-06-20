@@ -97,10 +97,10 @@ seed: ## Insert development seed data (org, user, stack) — Phase 0: not yet im
 	@echo "Phase 0: seed not implemented (no business logic in foundation phase)."
 
 run-server: ## Run the control plane server (requires dev-setup)
-	@[ -f .env ] && export $$(cat .env | xargs) ; $(GO) run ./cmd/stratum-server
+	@if [ -f .env ]; then set -a && . ./.env && set +a; fi; $(GO) run ./cmd/stratum-server
 
 run-worker: ## Run a worker agent (requires dev-setup and server running)
-	@[ -f .env ] && export $$(cat .env | xargs) ; $(GO) run ./cmd/stratum-worker
+	@if [ -f .env ]; then set -a && . ./.env && set +a; fi; $(GO) run ./cmd/stratum-worker
 
 # ─── Quality ──────────────────────────────────────────────────────────────────
 

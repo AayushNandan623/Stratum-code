@@ -1,16 +1,18 @@
 // Package api contains the HTTP server, router, and middleware for the
-// Stratum control plane. NewRouter builds the full route tree for Phase 1,
+// Stratum control plane. NewRouter builds the full route tree for Phase 2,
 // applying auth and RBAC middleware to the appropriate endpoints.
 package api
 
 import (
 	"encoding/json"
-	"net/http"
 	"log/slog"
+	"net/http"
 
 	"github.com/yourorg/stratum/internal/api/handlers"
 	"github.com/yourorg/stratum/internal/api/middleware"
+	"github.com/yourorg/stratum/internal/api/ws"
 	"github.com/yourorg/stratum/internal/iam"
+	"github.com/yourorg/stratum/internal/run"
 	"github.com/yourorg/stratum/internal/secret"
 	"github.com/yourorg/stratum/internal/stack"
 	"github.com/yourorg/stratum/internal/state"
@@ -24,10 +26,12 @@ type Deps struct {
 	SecretSvc secret.SecretService
 	StateSvc  state.StateService
 	VCSSvc    vcs.VCSService
+	RunSvc    run.RunService
+	WsHub     *ws.Hub
 	Logger    *slog.Logger
 }
 
-// NewRouter builds the HTTP handler tree for Phase 1. Every request is wrapped
+// NewRouter builds the HTTP handler tree for Phase 2. Every request is wrapped
 // in the request-id middleware; authenticated routes additionally use the auth
 // middleware, and mutating routes require the appropriate role.
 func NewRouter(deps Deps) http.Handler {
@@ -39,6 +43,8 @@ func NewRouter(deps Deps) http.Handler {
 	secretsH := handlers.NewSecretsHandler(deps.SecretSvc, deps.StackSvc)
 	stateH := handlers.NewStateHandler(deps.StateSvc, deps.StackSvc)
 	webhooksH := handlers.NewWebhooksHandler(deps.VCSSvc, deps.StackSvc, deps.Logger)
+	runsH := handlers.NewRunsHandler(deps.RunSvc, deps.WsHub, deps.Logger)
+	internalWorkersH := handlers.NewInternalWorkerHandler()
 
 	auth := middleware.Auth(deps.IAMSvc)
 	reader := middleware.RequireRole(iam.RoleStackReader)
@@ -92,6 +98,34 @@ func NewRouter(deps Deps) http.Handler {
 	mux.Handle("GET /api/v1/stacks/{stack_id}/state/versions", chain(stateH.ListVersions, auth, reader))
 	mux.Handle("POST /api/v1/stacks/{stack_id}/state/lock", chain(stateH.AcquireLock, auth, writer))
 	mux.Handle("DELETE /api/v1/stacks/{stack_id}/state/lock", chain(stateH.ReleaseLock, auth, writer))
+
+	// Runs — stack-scoped.
+	mux.Handle("POST /api/v1/stacks/{stack_id}/runs", chain(runsH.Create, auth, writer))
+	mux.Handle("GET /api/v1/stacks/{stack_id}/runs", chain(runsH.List, auth, reader))
+
+	// Runs — by run id.
+	mux.Handle("GET /api/v1/runs/{run_id}", chain(runsH.Get, auth, reader))
+	mux.Handle("POST /api/v1/runs/{run_id}/cancel", chain(runsH.Cancel, auth, writer))
+	mux.Handle("POST /api/v1/runs/{run_id}/approve", chain(runsH.Approve, auth, writer))
+	mux.Handle("POST /api/v1/runs/{run_id}/discard", chain(runsH.Discard, auth, writer))
+
+	// Run timeline and logs.
+	mux.Handle("GET /api/v1/runs/{run_id}/timeline", chain(runsH.GetTimeline, auth, reader))
+	mux.Handle("GET /api/v1/runs/{run_id}/logs", chain(runsH.GetLogs, auth, reader))
+
+	// Run event stream (WebSocket).
+	mux.Handle("GET /api/v1/runs/{run_id}/events/stream", chain(runsH.EventStream, auth))
+
+	// Internal worker API — stubs in Phase 2. No auth middleware yet; Phase 3
+	// adds worker token auth (internal/api/middleware/worker_auth.go).
+	mux.Handle("POST /api/v1/internal/workers/register", h(internalWorkersH.Register))
+	mux.Handle("GET /api/v1/internal/workers/{id}/jobs", h(internalWorkersH.GetJobs))
+	mux.Handle("POST /api/v1/internal/workers/{id}/heartbeat", h(internalWorkersH.Heartbeat))
+	mux.Handle("DELETE /api/v1/internal/workers/{id}", h(internalWorkersH.Deregister))
+	mux.Handle("POST /api/v1/internal/runs/{id}/events", h(internalWorkersH.AppendEvent))
+	mux.Handle("POST /api/v1/internal/runs/{id}/logs", h(internalWorkersH.AppendLogs))
+	mux.Handle("GET /api/v1/internal/runs/{id}/source-archive", h(internalWorkersH.GetSourceArchive))
+	mux.Handle("POST /api/v1/internal/runs/{id}/secrets/claim", h(internalWorkersH.ClaimSecrets))
 
 	return middleware.RequestID(mux)
 }

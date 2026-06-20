@@ -15,11 +15,14 @@ import (
 	"time"
 
 	"github.com/yourorg/stratum/internal/api"
+	"github.com/yourorg/stratum/internal/api/ws"
 	"github.com/yourorg/stratum/internal/iam"
+	"github.com/yourorg/stratum/internal/platform/clock"
 	"github.com/yourorg/stratum/internal/platform/config"
 	"github.com/yourorg/stratum/internal/platform/db"
 	"github.com/yourorg/stratum/internal/platform/logger"
 	"github.com/yourorg/stratum/internal/platform/telemetry"
+	"github.com/yourorg/stratum/internal/run"
 	"github.com/yourorg/stratum/internal/secret"
 	"github.com/yourorg/stratum/internal/stack"
 	"github.com/yourorg/stratum/internal/state"
@@ -89,6 +92,21 @@ func main() {
 	stateSvc := state.NewService(database)
 	vcsSvc := vcs.NewService(database, cfg.WebhookSecret, log)
 
+	// Phase 2: Run orchestration.
+	wsHub := ws.NewHub()
+	runSvc := run.NewService(database, wsHub, log)
+
+	sched := run.NewScheduler(
+		database,
+		run.NewRepository(),
+		runSvc,
+		stackSvc,
+		clock.New(),
+		5*time.Second,
+		log,
+	)
+	go sched.Start(ctx)
+
 	// HTTP server.
 	router := api.NewRouter(api.Deps{
 		IAMSvc:    iamSvc,
@@ -96,6 +114,8 @@ func main() {
 		SecretSvc: secretSvc,
 		StateSvc:  stateSvc,
 		VCSSvc:    vcsSvc,
+		RunSvc:    runSvc,
+		WsHub:     wsHub,
 		Logger:    log,
 	})
 	srv := api.New(":"+cfg.HTTPPort, router, log)
