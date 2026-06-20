@@ -1,0 +1,33 @@
+# Dockerfile for stratum-server (control plane)
+# Build: docker build -f deploy/Dockerfile.server -t stratum-server .
+
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /build
+
+# Download dependencies first (cached layer)
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Build binary
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /bin/stratum-server \
+    ./cmd/stratum-server
+
+# ─────────────────────────────────────────────────────────────
+
+FROM gcr.io/distroless/static:nonroot
+
+COPY --from=builder /bin/stratum-server /stratum-server
+
+# Migrations are baked into the image for simplicity.
+# For production, consider running migrations as a separate init container.
+COPY --from=builder /build/migrations /migrations
+
+EXPOSE 8080
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/stratum-server"]

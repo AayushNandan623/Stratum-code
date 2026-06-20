@@ -1,0 +1,43 @@
+# Dockerfile for the OpenTofu runner image
+# This is the container launched by the worker agent for each run.
+# It wraps the opentofu binary with Stratum-specific setup.
+#
+# Build: docker build -f deploy/Dockerfile.runner-opentofu -t stratum/runner-opentofu:1.6.0 .
+# Tag convention: stratum/runner-{tool}:{tool-version}
+
+ARG OPENTOFU_VERSION=1.6.0
+
+FROM ghcr.io/opentofu/opentofu:${OPENTOFU_VERSION} AS tofu
+
+FROM alpine:3.19
+
+# Install runtime dependencies
+RUN apk add --no-cache \
+    git \
+    ca-certificates \
+    curl \
+    jq
+
+# Copy opentofu binary
+COPY --from=tofu /usr/local/bin/tofu /usr/local/bin/tofu
+
+# Create non-root runner user
+RUN addgroup -g 10000 runner && \
+    adduser -u 10000 -G runner -D -H runner
+
+# Create workspace and state directories (worker mounts these)
+RUN mkdir -p /workspace /state && \
+    chown runner:runner /workspace /state
+
+# The Stratum runner wrapper script
+# Handles: backend config from env, provider caching, output normalization
+COPY deploy/runner-scripts/opentofu-runner.sh /usr/local/bin/runner
+RUN chmod +x /usr/local/bin/runner
+
+USER runner
+
+WORKDIR /workspace
+
+# The command is overridden by the worker executor based on run type.
+# Default entrypoint shows usage if run without arguments.
+ENTRYPOINT ["/usr/local/bin/tofu"]

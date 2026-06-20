@@ -1,0 +1,28 @@
+# Dockerfile for stratum-worker (agent binary)
+# Build: docker build -f deploy/Dockerfile.worker -t stratum-worker .
+
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /bin/stratum-worker \
+    ./cmd/stratum-worker
+
+# ─────────────────────────────────────────────────────────────
+
+FROM docker:26-dind-rootless
+
+# The worker agent needs access to the Docker daemon to launch execution containers.
+# In production: mount the host Docker socket or run Docker-in-Docker.
+
+COPY --from=builder /bin/stratum-worker /stratum-worker
+
+USER rootless
+
+ENTRYPOINT ["/stratum-worker"]

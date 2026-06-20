@@ -1,0 +1,75 @@
+# golangci-lint configuration for Stratum
+# Run: golangci-lint run ./...
+
+linters:
+  enable:
+    - errcheck          # check for unchecked errors
+    - gosimple          # simplification suggestions
+    - govet             # go vet checks
+    - ineffassign       # detect ineffectual assignments
+    - staticcheck       # comprehensive static analysis
+    - unused            # detect unused code
+    - gofmt             # formatting
+    - goimports         # import organization
+    - misspell          # spelling corrections
+    - revive            # opinionated Go linting
+    - noctx             # detect HTTP requests without context
+    - bodyclose         # detect unclosed HTTP response bodies
+    - sqlcloserows      # detect unclosed sql.Rows
+    - contextcheck      # verify context propagation
+    - godot             # doc comment ending with period
+
+  disable:
+    - exhaustive        # too noisy for enum switches during development
+    - wrapcheck         # too strict about error wrapping — we use fmt.Errorf consistently
+    - cyclop            # cyclomatic complexity — not useful early in development
+    - funlen            # function length — managed by code review, not linter
+    - gocognit          # cognitive complexity — too noisy
+
+linters-settings:
+  revive:
+    rules:
+      - name: exported              # exported types must have doc comments
+      - name: var-naming            # Go naming conventions
+      - name: error-return          # errors should be last return value
+      - name: error-naming          # error types should end in Error or Err
+      - name: if-return             # simplify if-else returns
+      - name: unused-parameter      # flag unused function parameters
+
+  gofmt:
+    simplify: true
+
+  goimports:
+    local-prefixes: github.com/yourorg/stratum
+
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+
+issues:
+  exclude-rules:
+    # Test files: allow t.Error without return, assert without check
+    - path: "_test\\.go"
+      linters: [errcheck, revive]
+
+    # Migration files: raw SQL, no go code to lint
+    - path: "migrations/"
+      linters: [all]
+
+    # Generated files
+    - path: ".*\\.gen\\.go"
+      linters: [all]
+
+  # Maximum issues per linter
+  max-issues-per-linter: 50
+  max-same-issues: 5
+
+run:
+  timeout: 5m
+  go: "1.22"
+
+  # Directories to exclude from linting
+  skip-dirs:
+    - vendor
+    - testdata
+    - scripts
