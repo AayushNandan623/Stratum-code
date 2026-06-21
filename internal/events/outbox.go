@@ -111,7 +111,7 @@ func (r *OutboxRelay) Start(ctx context.Context) {
 func (r *OutboxRelay) flush(ctx context.Context) error {
 	rows, err := r.db.Query(ctx, `
 		WITH claimed AS (
-			SELECT id, subject, payload, attempt
+			SELECT id
 			FROM outbox_messages
 			WHERE status = 'PENDING'
 			  AND deliver_after <= now()
@@ -121,7 +121,7 @@ func (r *OutboxRelay) flush(ctx context.Context) error {
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE outbox_messages m
-		SET status = 'IN_FLIGHT', attempt = attempt + 1
+		SET status = 'IN_FLIGHT', attempt = m.attempt + 1
 		FROM claimed
 		WHERE m.id = claimed.id
 		RETURNING m.id, m.subject, m.payload, m.attempt
