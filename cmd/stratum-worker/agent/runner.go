@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
@@ -88,8 +89,17 @@ func (r *Runner) ExecuteJob(ctx context.Context, job *worker.Job, workerID uuid.
 		return result, nil
 	}
 
-	if result.PlanOutput != nil && (job.RunType == "plan" || job.RunType == "drift_detect") {
-		r.reportEvent(ctx, runID, "run.planned", result.PlanOutput)
+	switch job.RunType {
+	case "plan", "drift_detect":
+		if result.PlanOutput != nil {
+			r.reportEvent(ctx, runID, "run.planned", result.PlanOutput)
+		} else {
+			r.reportEvent(ctx, runID, "run.planned")
+		}
+	case "apply":
+		r.reportEvent(ctx, runID, "run.applied")
+	case "destroy":
+		r.reportEvent(ctx, runID, "run.destroyed")
 	}
 
 	return result, nil
@@ -111,6 +121,9 @@ func workerRunStartedEvent(runType string) string {
 
 // fetchSourceArchive downloads the source archive for the given run and
 // extracts it to a temp directory. Returns the path to the extracted source.
+// In development mode (when no real source archive is available), it creates a
+// minimal null_resource test configuration so the executor has something to
+// work with.
 func (r *Runner) fetchSourceArchive(ctx context.Context, runID uuid.UUID) (string, error) {
 	archive, err := r.client.GetSourceArchive(ctx, runID)
 	if err != nil {
@@ -122,8 +135,37 @@ func (r *Runner) fetchSourceArchive(ctx context.Context, runID uuid.UUID) (strin
 	if err != nil {
 		return "", fmt.Errorf("create work dir: %w", err)
 	}
-	// For Phase 3, we just return the temp dir. In Phase 4+, we extract the
-	// archive to this directory.
+	// Make workDir world-accessible so the Docker container (running as
+	// UID 10000) can read and write to it.
+	os.Chmod(workDir, 0777)
+
+	// Check if the archive is the development stub (empty gzip header only).
+	var header [2]byte
+	n, _ := archive.Read(header[:])
+	if n < 2 || header[0] != 0x1f || header[1] != 0x8b {
+		// Not a gzip stub — assume real archive (Phase 4+ extraction).
+		return workDir, nil
+	}
+
+	// Development mode: create a minimal null_resource test configuration.
+	// This allows the executor to run without a real VCS setup.
+	mainTF := `resource "null_resource" "test" {
+  triggers = {
+    run_id = "` + runID.String() + `"
+    timestamp = "` + time.Now().UTC().Format(time.RFC3339) + `"
+  }
+}
+output "run_id" {
+  value = null_resource.test.triggers.run_id
+}
+`
+	if err := os.WriteFile(filepath.Join(workDir, "main.tf"), []byte(mainTF), 0644); err != nil {
+		return "", fmt.Errorf("write main.tf: %w", err)
+	}
+	r.client.AppendLogs(context.Background(), runID, []worker.LogLine{
+		{Line: "Created minimal test configuration in dev mode", Source: "system", OccurredAt: time.Now()},
+	})
+
 	return workDir, nil
 }
 

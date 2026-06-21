@@ -100,21 +100,31 @@ func (e *DockerExecutor) Execute(ctx context.Context, task *ExecutionTask) (*Exe
 		Image:      imageRef,
 		Cmd:        buildCommand(task),
 		Env:        e.buildEnv(task),
-		User:       "10000:10000",
+		User:       fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		WorkingDir: "/workspace",
+		// Override the image entrypoint (tofu) to use sh so we can run
+		// init before plan/apply.
+		Entrypoint: []string{"sh", "-c"},
 	}
 
+	// In development mode, use the host network so the container can reach
+	// the control plane's state API and download providers. Production
+	// deployments should configure a proper network (e.g. bridge with DNS).
+	networkMode := os.Getenv("STRATUM_DOCKER_NETWORK")
+	if networkMode == "" {
+		networkMode = "host" // default to host for development
+	}
 	hostCfg := &container.HostConfig{
-		NetworkMode: container.NetworkMode("none"),
+		NetworkMode: container.NetworkMode(networkMode),
 		Binds: []string{
-			fmt.Sprintf("%s:/workspace:ro", task.WorkDir),
+			fmt.Sprintf("%s:/workspace:rw", task.WorkDir),
 			fmt.Sprintf("%s:/state:rw", runStateDir),
 		},
 		Resources: container.Resources{
 			Memory:   512 * 1024 * 1024,
 			NanoCPUs: 1_000_000_000,
 		},
-		ReadonlyRootfs: true,
+		ReadonlyRootfs: false, // allow write to /tmp for provider downloads
 	}
 
 	resp, err := e.client.ContainerCreate(ctx, containerCfg, hostCfg, nil, nil, "")
@@ -164,6 +174,34 @@ func (e *DockerExecutor) Execute(ctx context.Context, task *ExecutionTask) (*Exe
 		}
 		if status.StatusCode != 0 {
 			result.Error = fmt.Sprintf("exit code %d", status.StatusCode)
+			// Capture container logs for debugging on failure.
+			logReader, logErr := e.client.ContainerLogs(context.Background(), containerID, dockertypes.ContainerLogsOptions{
+				ShowStdout: true, ShowStderr: true, Follow: false, Timestamps: false, Tail: "50",
+			})
+			if logErr == nil {
+				if logBytes, readErr := io.ReadAll(logReader); readErr == nil && len(logBytes) > 0 {
+					logStr := string(logBytes)
+					// Strip Docker 8-byte header from each frame for readability.
+					cleaned := make([]byte, 0, len(logStr))
+					for i := 0; i < len(logStr); {
+						if i+8 < len(logStr) {
+							size := int(logStr[i+7])
+							if i+8+size <= len(logStr) {
+								cleaned = append(cleaned, logStr[i+8:i+8+size]...)
+								i += 8 + size
+							} else {
+								break
+							}
+						} else {
+							break
+						}
+					}
+					if len(cleaned) > 0 {
+						result.Error = fmt.Sprintf("exit code %d: %s", status.StatusCode, string(cleaned))
+					}
+				}
+				logReader.Close()
+			}
 		}
 		return result, nil
 
@@ -211,17 +249,28 @@ func (e *DockerExecutor) buildEnv(task *ExecutionTask) []string {
 }
 
 func buildCommand(task *ExecutionTask) []string {
+	// Entrypoint is ["sh", "-c"], so Cmd should be a single command string.
 	switch task.RunType {
 	case WorkerRunTypePlan:
-		return []string{"plan", "-input=false", "-json", "-out=/state/plan.tfplan"}
+		return []string{
+			"tofu init -input=false -no-color >&2 && tofu plan -input=false -json -out=/state/plan.tfplan",
+		}
 	case WorkerRunTypeApply:
-		return []string{"apply", "-input=false", "-json", "/state/plan.tfplan"}
+		return []string{
+			"tofu init -input=false -no-color >&2 && if [ -f /state/plan.tfplan ]; then tofu apply -input=false -json /state/plan.tfplan; else tofu apply -input=false -json -auto-approve; fi",
+		}
 	case WorkerRunTypeDestroy:
-		return []string{"destroy", "-input=false", "-json", "-auto-approve"}
+		return []string{
+			"tofu init -input=false -no-color >&2 && tofu destroy -input=false -json -auto-approve",
+		}
 	case WorkerRunTypeDriftDetect:
-		return []string{"plan", "-input=false", "-json", "-refresh-only"}
+		return []string{
+			"tofu init -input=false -no-color >&2 && tofu plan -input=false -json -refresh-only",
+		}
 	default:
-		return []string{"plan", "-input=false", "-json", "-out=/state/plan.tfplan"}
+		return []string{
+			"tofu init -input=false -no-color >&2 && tofu plan -input=false -json -out=/state/plan.tfplan",
+		}
 	}
 }
 

@@ -77,6 +77,16 @@ func (r *Repository) Create(ctx context.Context, q db.DBTX, in CreateStackInput)
 	return s, nil
 }
 
+// CreateSchedule inserts a reconcile_schedules row for a stack. It is intended
+// to be called within the same transaction as stack creation.
+func (r *Repository) CreateSchedule(ctx context.Context, q db.DBTX, stackID, orgID uuid.UUID, intervalSecs, delaySecs float64) error {
+	const sql = `INSERT INTO reconcile_schedules (stack_id, org_id, reconcile_interval, next_check_at)
+		VALUES ($1, $2, make_interval(secs => $3), now() + make_interval(secs => $4))
+		ON CONFLICT (stack_id) DO NOTHING`
+	_, err := q.Exec(ctx, sql, stackID, orgID, intervalSecs, delaySecs)
+	return err
+}
+
 // GetByID fetches a non-deleted stack scoped to orgID.
 func (r *Repository) GetByID(ctx context.Context, q db.DBTX, orgID, id uuid.UUID) (*Stack, error) {
 	const sql = `SELECT ` + stackColumns + ` FROM stacks

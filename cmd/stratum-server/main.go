@@ -19,6 +19,8 @@ import (
 	"github.com/yourorg/stratum/internal/platform/db"
 	"github.com/yourorg/stratum/internal/platform/logger"
 	"github.com/yourorg/stratum/internal/platform/telemetry"
+	"github.com/yourorg/stratum/internal/policy"
+	"github.com/yourorg/stratum/internal/reconcile"
 	"github.com/yourorg/stratum/internal/run"
 	"github.com/yourorg/stratum/internal/secret"
 	"github.com/yourorg/stratum/internal/stack"
@@ -84,15 +86,28 @@ func main() {
 	stateSvc := state.NewService(database)
 	vcsSvc := vcs.NewService(database, cfg.WebhookSecret, log)
 
+	// Phase 4: Policy engine.
+	policyRepo := policy.NewRepository()
+	bundleLoader := policy.NewBundleLoader(policyRepo, database.Pool, log)
+	go bundleLoader.Start(ctx)
+	policySvc := policy.NewService(database, bundleLoader, log)
+
 	// Phase 2: Run orchestration.
 	wsHub := ws.NewHub()
 	runSvc := run.NewService(database, wsHub, log)
+
+	// Phase 5: Reconciler (needs runSvc; then sets itself as run's drift handler).
+	reconcileSvc := reconcile.NewService(database, runSvc, stackSvc, log)
+	reconcileCtrl := reconcile.NewController(database, runSvc, stackSvc, 5, log)
+	go reconcileCtrl.Start(ctx)
+	runSvc.SetDriftHandler(reconcileSvc)
 
 	sched := run.NewScheduler(
 		database,
 		run.NewRepository(),
 		runSvc,
 		stackSvc,
+		policySvc,
 		clock.New(),
 		5*time.Second,
 		log,
@@ -107,6 +122,8 @@ func main() {
 		IAMSvc:           iamSvc,
 		StackSvc:         stackSvc,
 		SecretSvc:        secretSvc,
+		PolicySvc:        policySvc,
+		ReconcileSvc:     reconcileSvc,
 		StateSvc:         stateSvc,
 		VCSSvc:           vcsSvc,
 		RunSvc:           runSvc,

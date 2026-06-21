@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/yourorg/stratum/internal/platform/clock"
 	"github.com/yourorg/stratum/internal/platform/db"
+	"github.com/yourorg/stratum/internal/policy"
 	"github.com/yourorg/stratum/internal/stack"
 )
 
@@ -21,6 +23,7 @@ type Scheduler struct {
 	runRepo  *Repository
 	runSvc   RunService
 	stackSvc stack.StackService
+	policySvc policy.PolicyService
 	clock    clock.Clock
 	interval time.Duration
 	logger   *slog.Logger
@@ -32,6 +35,7 @@ func NewScheduler(
 	runRepo *Repository,
 	runSvc RunService,
 	stackSvc stack.StackService,
+	policySvc policy.PolicyService,
 	clk clock.Clock,
 	interval time.Duration,
 	logger *slog.Logger,
@@ -40,13 +44,14 @@ func NewScheduler(
 		interval = 5 * time.Second
 	}
 	return &Scheduler{
-		db:       database,
-		runRepo:  runRepo,
-		runSvc:   runSvc,
-		stackSvc: stackSvc,
-		clock:    clk,
-		interval: interval,
-		logger:   logger,
+		db:        database,
+		runRepo:   runRepo,
+		runSvc:    runSvc,
+		stackSvc:  stackSvc,
+		policySvc: policySvc,
+		clock:     clk,
+		interval:  interval,
+		logger:    logger,
 	}
 }
 
@@ -85,6 +90,17 @@ func (s *Scheduler) tick(ctx context.Context) {
 			continue
 		}
 		s.enqueue(ctx, run)
+	}
+	// 2b. Process PLANNED runs for policy evaluation gate.
+	plannedRuns, err := s.runRepo.ListByState(ctx, s.db.Pool, StatePlanned)
+	if err != nil {
+		s.logger.Error("scheduler: list planned runs", "error", err)
+	} else {
+		for _, run := range plannedRuns {
+			if err := s.evaluatePolicyGate(ctx, run); err != nil {
+				s.logger.Error("scheduler: policy evaluation", "run_id", run.ID, "error", err)
+			}
+		}
 	}
 	// 3. Handle timed-out job claims.
 	s.requeueTimedOutJobs(ctx)
@@ -149,15 +165,23 @@ func (s *Scheduler) hasOtherActiveRun(ctx context.Context, run *Run) bool {
 }
 
 // enqueue transitions a run from PENDING to QUEUED and creates an AVAILABLE
-// job row so workers can pick it up (Phase 3+).
+// job row so workers can pick it up. The job's pool_id is set from the stack
+// to ensure only workers in the correct pool can claim it.
 func (s *Scheduler) enqueue(ctx context.Context, run *Run) {
 	if err := s.runSvc.Transition(ctx, run.ID, StateQueued, nil); err != nil {
 		s.logger.Error("scheduler: transition to queued", "run_id", run.ID, "error", err)
 		return
 	}
+	// Fetch the stack to get the worker pool assignment.
+	stk, err := s.stackSvc.Get(ctx, run.OrgID, run.StackID)
+	if err != nil {
+		s.logger.Error("scheduler: get stack for job pool", "stack_id", run.StackID, "error", err)
+		// Create the job without pool assignment as fallback.
+	}
 	job := &RunJob{
 		ID:        uuid.New(),
 		RunID:     run.ID,
+		PoolID:    stk.WorkerPoolID,
 		Status:    "AVAILABLE",
 		Attempt:   0,
 		CreatedAt: s.clock.Now(),
@@ -216,6 +240,141 @@ func (s *Scheduler) requeueTimedOutJobs(ctx context.Context) {
 	}
 }
 
+// ─── Policy evaluation gate ─────────────────────────────────────────────────
+
+// evaluatePolicyGate evaluates all policies for a PLANNED run. It always
+// writes a policy.evaluated event, regardless of verdict. On HARD_FAIL the
+// run transitions to POLICY_REJECTED. On allow (including SOFT_WARN) the
+// run transitions to the next appropriate state.
+func (s *Scheduler) evaluatePolicyGate(ctx context.Context, run *Run) error {
+	planOutput, err := s.runRepo.GetPlanOutput(ctx, s.db.Pool, run.ID)
+	if err != nil {
+		s.logger.Error("scheduler: get plan output for policy eval", "run_id", run.ID, "error", err)
+		return err
+	}
+
+	verdict, err := s.policySvc.Evaluate(ctx, policy.EvaluationInput{
+		RunID:      run.ID,
+		OrgID:      run.OrgID,
+		StackID:    run.StackID,
+		SpaceID:    run.SpaceID,
+		RunType:    string(run.RunType),
+		Actor:      s.buildActorContext(run),
+		Stack:      s.buildStackContext(ctx, run),
+		PlanOutput: buildVerdictPlanContext(planOutput),
+	})
+	if err != nil {
+		s.logger.Error("scheduler: policy evaluation error", "run_id", run.ID, "err", err)
+		return err
+	}
+
+	// Always write the policy.evaluated event.
+	evPayload, _ := json.Marshal(map[string]any{
+		"allow":       verdict.Allow,
+		"severity":    verdict.Severity,
+		"violations":  verdict.Violations,
+		"policy_ids":  verdict.PolicyIDs,
+		"duration_ms": verdict.DurationMs,
+	})
+	if err := s.runSvc.AppendEvent(ctx, run.ID, RunEventInput{
+		EventType:  "policy.evaluated",
+		ActorType:  "system",
+		Payload:    evPayload,
+		OccurredAt: s.clock.Now(),
+	}); err != nil {
+		s.logger.Error("scheduler: append policy.evaluated event", "run_id", run.ID, "error", err)
+	}
+
+	if !verdict.Allow {
+		s.logger.Warn("scheduler: policy HARD_FAIL, rejecting run",
+			"run_id", run.ID, "violations", len(verdict.Violations))
+		return s.runSvc.Transition(ctx, run.ID, StatePolicyRejected, map[string]any{
+			"violations": verdict.Violations,
+			"severity":   verdict.Severity,
+		})
+	}
+
+	if len(verdict.Violations) > 0 {
+		s.logger.Info("scheduler: policy SOFT_WARN, proceeding",
+			"run_id", run.ID, "violations", len(verdict.Violations))
+	}
+
+	nextState := s.determinePostPlanState(ctx, run)
+	return s.runSvc.Transition(ctx, run.ID, nextState, map[string]any{
+		"policy_severity": verdict.Severity,
+		"violations":      verdict.Violations,
+	})
+}
+
+// determinePostPlanState returns the next state for a PLANNED run after policy
+// evaluation passes. Drift detect runs go directly to APPLIED; other run types
+// check the stack's auto-apply setting.
+func (s *Scheduler) determinePostPlanState(ctx context.Context, run *Run) RunState {
+	if run.RunType == RunTypeDriftDetect {
+		return StateApplied
+	}
+	stk, err := s.stackSvc.Get(ctx, run.OrgID, run.StackID)
+	if err != nil {
+		s.logger.Error("scheduler: get stack for post-plan state", "stack_id", run.StackID, "error", err)
+		return StateAwaitingApproval
+	}
+	if stk.AutoApply {
+		return StateApplying
+	}
+	return StateAwaitingApproval
+}
+
+// buildActorContext constructs the policy actor context from a run.
+func (s *Scheduler) buildActorContext(run *Run) policy.ActorContext {
+	actorType := "SYSTEM"
+	if run.TriggeredBy != nil {
+		actorType = "USER"
+	}
+	return policy.ActorContext{
+		ID:    uuid.Nil,
+		Type:  actorType,
+		Roles: nil,
+	}
+}
+
+// buildStackContext loads stack details for policy evaluation input.
+func (s *Scheduler) buildStackContext(ctx context.Context, run *Run) policy.StackContext {
+	stk, err := s.stackSvc.Get(ctx, run.OrgID, run.StackID)
+	if err != nil {
+		s.logger.Error("scheduler: get stack for policy context", "stack_id", run.StackID, "error", err)
+		return policy.StackContext{Name: "unknown", Labels: map[string]string{}, Space: ""}
+	}
+	space := ""
+	if run.SpaceID != nil {
+		space = run.SpaceID.String()
+	}
+	return policy.StackContext{
+		Name:   stk.Name,
+		Labels: map[string]string{},
+		Space:  space,
+	}
+}
+
+// buildVerdictPlanContext converts a run PlanOutput to a policy PlanContext.
+func buildVerdictPlanContext(output *PlanOutput) *policy.PlanContext {
+	if output == nil {
+		return nil
+	}
+	changes := make([]policy.ResourceChange, len(output.Resources))
+	for i, rc := range output.Resources {
+		changes[i] = policy.ResourceChange{
+			Address: rc.Address,
+			Actions: rc.Actions,
+		}
+	}
+	return &policy.PlanContext{
+		ResourceChanges: changes,
+		TotalAdded:      output.Added,
+		TotalChanged:    output.Changed,
+		TotalRemoved:    output.Removed,
+	}
+}
+
 // ensureQueuedRunsHaveJobs creates missing AVAILABLE jobs for QUEUED runs that
 // don't have one. This self-heals cases where a server crash between the state
 // transition and job creation left the run in QUEUED with no job.
@@ -235,9 +394,15 @@ func (s *Scheduler) ensureQueuedRunsHaveJobs(ctx context.Context) {
 		return
 	}
 	for _, r := range runs {
+		// Fetch stack to get pool assignment.
+		stk, err := s.stackSvc.Get(ctx, r.OrgID, r.StackID)
+		if err != nil {
+			s.logger.Error("scheduler: get stack for missing job", "stack_id", r.StackID, "error", err)
+		}
 		job := &RunJob{
 			ID:        uuid.New(),
 			RunID:     r.ID,
+			PoolID:    stk.WorkerPoolID,
 			Status:    "AVAILABLE",
 			Attempt:   0,
 			CreatedAt: s.clock.Now(),

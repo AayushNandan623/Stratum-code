@@ -241,6 +241,26 @@ func (r *Repository) DeregisterWorker(ctx context.Context, q db.DBTX, id uuid.UU
 	return nil
 }
 
+// ReactivateWorker re-activates a deregistered worker, updating its metadata
+// and clearing any stale run state. Used when a worker restarts and reconnects
+// with the same pool token.
+func (r *Repository) ReactivateWorker(ctx context.Context, q db.DBTX, w *Worker) error {
+	const sql = `UPDATE workers SET
+		status = $2, hostname = $3, version = $4, capabilities = $5,
+		last_heartbeat = $6, current_run_id = NULL
+		WHERE id = $1`
+	tag, err := q.Exec(ctx, sql,
+		w.ID, string(w.Status), w.Hostname, w.Version,
+		w.Capabilities, w.LastHeartbeat)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrWorkerNotFound
+	}
+	return nil
+}
+
 // ─── Jobs ───────────────────────────────────────────────────────────────────
 
 // GetRunJob fetches the AVAILABLE job for a run, locking it for the given worker.

@@ -30,6 +30,7 @@ type createStackRequest struct {
 	WorkingDir        string `json:"working_dir"`
 	IACTool           string `json:"iac_tool"`
 	IACVersion        string `json:"iac_version"`
+	WorkerPoolID      string `json:"worker_pool_id"`
 	AutoApply         bool   `json:"auto_apply"`
 	ReconcileInterval int64  `json:"reconcile_interval_seconds"`
 	DriftMode         string `json:"drift_mode"`
@@ -49,6 +50,13 @@ func (h *StacksHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	var poolID *uuid.UUID
+	if req.WorkerPoolID != "" {
+		pid, err := uuid.Parse(req.WorkerPoolID)
+		if err == nil {
+			poolID = &pid
+		}
+	}
 	s, err := h.svc.Create(r.Context(), stack.CreateStackInput{
 		OrgID:             orgID,
 		Name:              req.Name,
@@ -57,6 +65,7 @@ func (h *StacksHandler) Create(w http.ResponseWriter, r *http.Request) {
 		WorkingDir:        req.WorkingDir,
 		IACTool:           req.IACTool,
 		IACVersion:        req.IACVersion,
+		WorkerPoolID:      poolID,
 		AutoApply:         req.AutoApply,
 		ReconcileInterval: time.Duration(req.ReconcileInterval) * time.Second,
 		DriftMode:         stack.DriftMode(req.DriftMode),

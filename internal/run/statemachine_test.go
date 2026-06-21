@@ -19,7 +19,7 @@ var allStates = []RunState{
 var legalTransitions = map[RunState][]RunState{
 	StatePending:          {StateQueued, StateCancelled},
 	StateQueued:           {StateAssigned, StateCancelled},
-	StateAssigned:         {StatePlanning, StateCancelled, StateQueued},
+	StateAssigned:         {StatePlanning, StateApplying, StateCancelled, StateQueued, StateFailed},
 	StatePlanning:         {StatePlanned, StateFailed, StateCancelled},
 	StatePlanned:          {StateAwaitingApproval, StateApplying, StatePolicyRejected, StateDiscarded, StateCancelled},
 	StateAwaitingApproval: {StateApplying, StateDiscarded, StateCancelled},

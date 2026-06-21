@@ -208,6 +208,7 @@ var eventToState = map[string]run.RunState{
 	"run.applied":          run.StateApplied,
 	"run.failed":           run.StateFailed,
 	"run.cancelled":        run.StateCancelled,
+	"run.destroyed":        run.StateApplied, // destroy success maps to applied state
 }
 
 // AppendEvent handles POST /api/v1/internal/runs/{id}/events.

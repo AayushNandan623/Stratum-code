@@ -133,7 +133,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			continue
 		}
 
-		a.logger.Info("job completed", "run_id", job.RunID, "exit_code", result.ExitCode)
+		a.logger.Info("job completed", "run_id", job.RunID, "exit_code", result.ExitCode, "error", result.Error)
 	}
 }
 

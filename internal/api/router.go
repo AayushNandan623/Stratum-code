@@ -12,6 +12,8 @@ import (
 	"github.com/yourorg/stratum/internal/api/middleware"
 	"github.com/yourorg/stratum/internal/api/ws"
 	"github.com/yourorg/stratum/internal/iam"
+	"github.com/yourorg/stratum/internal/policy"
+	"github.com/yourorg/stratum/internal/reconcile"
 	"github.com/yourorg/stratum/internal/run"
 	"github.com/yourorg/stratum/internal/secret"
 	"github.com/yourorg/stratum/internal/stack"
@@ -25,6 +27,8 @@ type Deps struct {
 	IAMSvc           iam.IAMService
 	StackSvc         stack.StackService
 	SecretSvc        secret.SecretService
+	PolicySvc        policy.PolicyService
+	ReconcileSvc     reconcile.ReconcileService
 	StateSvc         state.StateService
 	VCSSvc           vcs.VCSService
 	RunSvc           run.RunService
@@ -56,6 +60,8 @@ func NewRouter(deps Deps) http.Handler {
 		deps.VCSSvc,
 		deps.WorkerHMACSecret,
 	)
+	policiesH := handlers.NewPoliciesHandler(deps.PolicySvc, deps.StackSvc)
+	reconcileH := handlers.NewReconcileHandler(deps.ReconcileSvc, deps.StackSvc)
 
 	auth := middleware.Auth(deps.IAMSvc)
 	reader := middleware.RequireRole(iam.RoleStackReader)
@@ -102,6 +108,19 @@ func NewRouter(deps Deps) http.Handler {
 	mux.Handle("PATCH /api/v1/stacks/{stack_id}", chain(stacksH.Update, auth, writer))
 	mux.Handle("DELETE /api/v1/stacks/{stack_id}", chain(stacksH.Delete, auth, writer))
 
+	// Reconcile / drift detection — stack-scoped.
+	mux.Handle("GET /api/v1/stacks/{stack_id}/reconcile", chain(reconcileH.GetSchedule, auth, reader))
+	mux.Handle("PATCH /api/v1/stacks/{stack_id}/reconcile", chain(reconcileH.UpdateSchedule, auth, writer))
+	mux.Handle("POST /api/v1/stacks/{stack_id}/reconcile/trigger", chain(reconcileH.TriggerNow, auth, writer))
+
+	// Drift records — stack-scoped.
+	mux.Handle("GET /api/v1/stacks/{stack_id}/drift", chain(reconcileH.ListDriftRecords, auth, reader))
+	mux.Handle("GET /api/v1/orgs/{org_id}/drift", chain(reconcileH.ListDriftRecords, auth, reader))
+
+	// Drift records — by id.
+	mux.Handle("GET /api/v1/drift/{drift_id}", chain(reconcileH.GetDriftRecord, auth, reader))
+	mux.Handle("POST /api/v1/drift/{drift_id}/ignore", chain(reconcileH.IgnoreDrift, auth, writer))
+
 	// Stack dependencies.
 	mux.Handle("POST /api/v1/stacks/{stack_id}/dependencies", chain(stacksH.AddDependency, auth, writer))
 	mux.Handle("DELETE /api/v1/stacks/{stack_id}/dependencies/{dep_id}", chain(stacksH.RemoveDependency, auth, writer))
@@ -139,6 +158,26 @@ func NewRouter(deps Deps) http.Handler {
 
 	// Run event stream (WebSocket).
 	mux.Handle("GET /api/v1/runs/{run_id}/events/stream", chain(runsH.EventStream, auth))
+
+	// Policy management — org-scoped.
+	mux.Handle("POST /api/v1/orgs/{org_id}/policies", chain(policiesH.Create, auth, writer))
+	mux.Handle("GET /api/v1/orgs/{org_id}/policies", chain(policiesH.List, auth, reader))
+	mux.Handle("POST /api/v1/orgs/{org_id}/policies/dry-run", chain(policiesH.DryRun, auth, writer))
+
+	// Policy — by policy id.
+	mux.Handle("GET /api/v1/policies/{policy_id}", chain(policiesH.Get, auth, reader))
+	mux.Handle("PATCH /api/v1/policies/{policy_id}", chain(policiesH.Update, auth, writer))
+	mux.Handle("PUT /api/v1/policies/{policy_id}/source", chain(policiesH.UpdateSource, auth, writer))
+	mux.Handle("DELETE /api/v1/policies/{policy_id}", chain(policiesH.Delete, auth, writer))
+
+	// Policy sets — org-scoped.
+	mux.Handle("POST /api/v1/orgs/{org_id}/policy-sets", chain(policiesH.CreatePolicySet, auth, writer))
+
+	// Policy sets — by set id.
+	mux.Handle("POST /api/v1/policy-sets/{set_id}/members", chain(policiesH.AddToSet, auth, writer))
+	mux.Handle("DELETE /api/v1/policy-sets/{set_id}/members/{policy_id}", chain(policiesH.RemoveFromSet, auth, writer))
+	mux.Handle("POST /api/v1/policy-sets/{set_id}/bindings", chain(policiesH.BindSet, auth, writer))
+	mux.Handle("DELETE /api/v1/policy-sets/{set_id}/bindings/{binding_id}", chain(policiesH.UnbindSet, auth, writer))
 
 	// Internal worker API — register uses pool token auth (no worker record yet);
 	// all other internal endpoints use worker token auth.

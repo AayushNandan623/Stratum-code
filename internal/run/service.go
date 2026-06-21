@@ -20,6 +20,14 @@ type EventPublisher interface {
 	PublishRunEvent(runID string, data []byte)
 }
 
+// DriftHandler is the interface the reconcile context implements for drift
+// result processing. It is OPTIONAL (nil-safe) to keep the dependency one-way:
+// run → reconcile, never reverse.
+type DriftHandler interface {
+	ProcessDriftResult(ctx context.Context, runID uuid.UUID, planOutput *PlanOutput) error
+	ResolveDrift(ctx context.Context, stackID uuid.UUID) error
+}
+
 // RunService is the boundary contract for the run context.
 type RunService interface {
 	Create(ctx context.Context, input CreateRunInput) (*Run, error)
@@ -42,23 +50,28 @@ type RunService interface {
 	// Logs
 	AppendLogs(ctx context.Context, runID uuid.UUID, lines []LogLine) error
 	GetLogs(ctx context.Context, runID uuid.UUID, page Pagination) ([]*LogLine, int, error)
+
+	// Drift handler wiring (Phase 5+); nil-safe when unset.
+	SetDriftHandler(h DriftHandler)
 }
 
 type service struct {
-	repo      *Repository
-	events    *EventStore
-	sm        *StateMachine
-	db        *db.DB
-	hub       EventPublisher // optional — nil is safe
-	logger    *slog.Logger
+	repo         *Repository
+	events       *EventStore
+	sm           *StateMachine
+	db           *db.DB
+	hub          EventPublisher // optional — nil is safe
+	driftHandler DriftHandler   // optional — nil is safe (set in Phase 5)
+	logger       *slog.Logger
 }
 
 var _ RunService = (*service)(nil)
 
 // NewService constructs a RunService. hub is optional; pass nil for no event
-// broadcasting (e.g. in tests).
-func NewService(database *db.DB, hub EventPublisher, logger *slog.Logger) RunService {
-	return &service{
+// broadcasting (e.g. in tests). driftHandler is optional; pass nil for no
+// drift result processing (set in Phase 5+).
+func NewService(database *db.DB, hub EventPublisher, logger *slog.Logger, driftHandler ...DriftHandler) RunService {
+	s := &service{
 		repo:   NewRepository(),
 		events: NewEventStore(),
 		sm:     NewStateMachine(),
@@ -66,6 +79,10 @@ func NewService(database *db.DB, hub EventPublisher, logger *slog.Logger) RunSer
 		hub:    hub,
 		logger: logger,
 	}
+	if len(driftHandler) > 0 {
+		s.driftHandler = driftHandler[0]
+	}
+	return s
 }
 
 // ─── Create ─────────────────────────────────────────────────────────────────
@@ -159,7 +176,13 @@ func (s *service) Discard(ctx context.Context, id uuid.UUID, actorID uuid.UUID) 
 // ─── Transition ─────────────────────────────────────────────────────────────
 
 func (s *service) Transition(ctx context.Context, id uuid.UUID, to RunState, meta any) error {
-	return s.db.InTx(ctx, func(q db.DBTX) error {
+	var runData struct {
+		OrgID   uuid.UUID
+		StackID uuid.UUID
+		RunType RunType
+	}
+
+	err := s.db.InTx(ctx, func(q db.DBTX) error {
 		run, err := s.repo.LockRun(ctx, q, id)
 		if err != nil {
 			return err
@@ -183,8 +206,41 @@ func (s *service) Transition(ctx context.Context, id uuid.UUID, to RunState, met
 			return err
 		}
 		s.broadcastEvent(id.String(), ev)
+		runData.OrgID = run.OrgID
+		runData.StackID = run.StackID
+		runData.RunType = run.RunType
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	// After APPLIED, fire drift handler (if configured) in a goroutine.
+	if to == StateApplied && s.driftHandler != nil {
+		runID := id
+		rt := runData.RunType
+		stkID := runData.StackID
+		go func() {
+			// Use background context since the request context may be cancelled.
+			ctx := context.Background()
+			switch rt {
+			case RunTypeDriftDetect:
+				planOut, err := s.GetPlanOutput(ctx, runID)
+				if err != nil {
+					s.logger.Error("drift handler: get plan output", "run_id", runID, "error", err)
+					return
+				}
+				if err := s.driftHandler.ProcessDriftResult(ctx, runID, planOut); err != nil {
+					s.logger.Error("drift handler: process drift result", "run_id", runID, "error", err)
+				}
+			case RunTypeApply, RunTypePlan, RunTypeDestroy:
+				if err := s.driftHandler.ResolveDrift(ctx, stkID); err != nil {
+					s.logger.Error("drift handler: resolve drift", "stack_id", stkID, "error", err)
+				}
+			}
+		}()
+	}
+	return nil
 }
 
 // transitionWithActor is like Transition but appends an actor reference to the
@@ -275,6 +331,13 @@ func (s *service) GetPlanOutput(ctx context.Context, runID uuid.UUID) (*PlanOutp
 
 func (s *service) StorePlanOutput(ctx context.Context, runID uuid.UUID, output *PlanOutput) error {
 	return s.repo.StorePlanOutput(ctx, s.db.Pool, runID, output)
+}
+
+// SetDriftHandler sets the drift handler after service construction. This
+// breaks the circular init dependency: run is created first, reconcile is
+// created with run, then reconcile is set on run via this method.
+func (s *service) SetDriftHandler(h DriftHandler) {
+	s.driftHandler = h
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

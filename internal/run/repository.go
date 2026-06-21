@@ -318,25 +318,37 @@ func (r *Repository) CreateJob(ctx context.Context, q db.DBTX, job *RunJob) erro
 }
 
 // ClaimJob atomically claims an AVAILABLE job using SELECT FOR UPDATE SKIP
-// LOCKED and returns the claimed job. Returns ErrNoJobAvailable if none found.
-func (r *Repository) ClaimJob(ctx context.Context, q db.DBTX, workerID uuid.UUID, timeout time.Duration) (*RunJob, error) {
+// LOCKED and returns the claimed job. If poolID is non-nil, only jobs
+// assigned to that pool are considered. Returns ErrNoJobAvailable if none found.
+func (r *Repository) ClaimJob(ctx context.Context, q db.DBTX, workerID uuid.UUID, timeout time.Duration, poolID *uuid.UUID) (*RunJob, error) {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	const sql = `UPDATE run_jobs SET
+	claimSQL := `UPDATE run_jobs SET
 		status = 'CLAIMED',
 		claimed_by = $1,
 		claimed_at = NOW(),
 		expires_at = NOW() + $2::interval
 		WHERE id = (
 			SELECT id FROM run_jobs
-			WHERE status = 'AVAILABLE'
+			WHERE status = 'AVAILABLE'`
+	if poolID != nil {
+		claimSQL += ` AND (pool_id IS NULL OR pool_id = $3)`
+	}
+	claimSQL += `
 			ORDER BY created_at
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
 		RETURNING ` + jobColumns
-	job, err := scanJob(q.QueryRow(ctx, sql, workerID, fmt.Sprintf("%.0f seconds", timeout.Seconds())))
+
+	var job *RunJob
+	var err error
+	if poolID != nil {
+		job, err = scanJob(q.QueryRow(ctx, claimSQL, workerID, fmt.Sprintf("%.0f seconds", timeout.Seconds()), *poolID))
+	} else {
+		job, err = scanJob(q.QueryRow(ctx, claimSQL, workerID, fmt.Sprintf("%.0f seconds", timeout.Seconds())))
+	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNoJobAvailable

@@ -24,7 +24,8 @@ func NewService(database *db.DB) StackService {
 
 var _ StackService = (*service)(nil)
 
-// Create inserts a new stack after applying field defaults.
+// Create inserts a new stack after applying field defaults. It also creates a
+// reconcile_schedules row in the same transaction so drift detection is ready.
 func (s *service) Create(ctx context.Context, in CreateStackInput) (*Stack, error) {
 	if in.OrgID == uuid.Nil || in.Name == "" {
 		return nil, domainerr.ErrValidation
@@ -47,7 +48,26 @@ func (s *service) Create(ctx context.Context, in CreateStackInput) (*Stack, erro
 	if in.ReconcileInterval <= 0 {
 		in.ReconcileInterval = time.Hour
 	}
-	return s.repo.Create(ctx, s.db.Pool, in)
+
+	var stk *Stack
+	err := s.db.InTx(ctx, func(q db.DBTX) error {
+		var err error
+		stk, err = s.repo.Create(ctx, q, in)
+		if err != nil {
+			return err
+		}
+		// Insert reconcile schedule with first check delayed by one interval.
+		firstCheckDelay := in.ReconcileInterval.Seconds()
+		if err := s.repo.CreateSchedule(ctx, q, stk.ID, stk.OrgID,
+			in.ReconcileInterval.Seconds(), firstCheckDelay); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return stk, nil
 }
 
 func (s *service) Get(ctx context.Context, orgID, id uuid.UUID) (*Stack, error) {

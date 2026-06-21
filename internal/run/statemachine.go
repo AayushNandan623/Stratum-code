@@ -20,14 +20,14 @@ func NewStateMachine() *StateMachine {
 //	PENDING  ──→ QUEUED ──→ ASSIGNED ──→ PLANNING ──→ PLANNED ──→ AWAITING_APPROVAL ──→ APPLYING ──→ APPLIED
 //	  │            │            │             │            │              │                  │
 //	  └──→ CANCELLED ←─────────┴─────────────┴──→ FAILED ←┴──────────────┴──────────────────┴──→ FAILED
-//	                                                   │                                        (also FAILED)
-//	                                                   PLANNED  ──→ POLICY_REJECTED
-//	                                                   PLANNED  ──→ DISCARDED
-//	                                                   AWAITING_APPROVAL ──→ DISCARDED
+//	                   │         │                        │                                        (also FAILED)
+//	                   │         └──→ APPLYING            PLANNED  ──→ POLICY_REJECTED
+//	                   │                                   PLANNED  ──→ DISCARDED
+//	                   └──→ FAILED                         AWAITING_APPROVAL ──→ DISCARDED
 var ValidTransitions = map[RunState][]RunState{
 	StatePending:          {StateQueued, StateCancelled},
 	StateQueued:           {StateAssigned, StateCancelled},
-	StateAssigned:         {StatePlanning, StateCancelled, StateQueued},
+	StateAssigned:         {StatePlanning, StateApplying, StateCancelled, StateQueued, StateFailed},
 	StatePlanning:         {StatePlanned, StateFailed, StateCancelled},
 	StatePlanned:          {StateAwaitingApproval, StateApplying, StatePolicyRejected, StateDiscarded, StateCancelled},
 	StateAwaitingApproval: {StateApplying, StateDiscarded, StateCancelled},

@@ -149,6 +149,38 @@ func (s *service) Register(ctx context.Context, input RegisterWorkerInput) (*Wor
 		return nil, domainerr.ErrValidation
 	}
 	now := time.Now()
+
+	// Check if a worker with this token_hash already exists. This handles the
+	// re-registration case — after a crash or restart the worker connects with
+	// the same pool token, so we re-activate the previous record instead of
+	// INSERTing a duplicate (token_hash has a UNIQUE index).
+	existing, err := s.repo.GetWorkerByTokenHash(ctx, s.db.Pool, input.TokenHash)
+	if err != nil && !errors.Is(err, ErrWorkerNotFound) {
+		return nil, err
+	}
+	if existing != nil {
+		if existing.Status == StatusDeregistered {
+			// Re-activate the deregistered worker.
+			existing.Status = StatusIDLE
+			existing.Hostname = input.Hostname
+			existing.Version = input.Version
+			existing.Capabilities = input.Capabilities
+			existing.LastHeartbeat = &now
+			existing.CurrentRunID = nil
+			// Update in the database — reset status, refresh metadata, clear run.
+			err := s.repo.ReactivateWorker(ctx, s.db.Pool, existing)
+			if err != nil {
+				return nil, err
+			}
+			s.logger.Info("worker re-registered (reactivated)",
+				"worker_id", existing.ID, "pool_id", input.PoolID)
+			return existing, nil
+		}
+		// Worker is still active — another instance is using this token.
+		return nil, domainerr.New("WORKER_ALREADY_REGISTERED", 409,
+			"a worker with this token is already registered and active")
+	}
+
 	w := &Worker{
 		ID:             uuid.New(),
 		PoolID:         input.PoolID,
@@ -194,14 +226,21 @@ func (s *service) GetByTokenHash(ctx context.Context, hash string) (*Worker, err
 // ─── Job dispatch ───────────────────────────────────────────────────────────
 
 func (s *service) ClaimJob(ctx context.Context, workerID uuid.UUID, timeout time.Duration) (*Job, error) {
-	if timeout <= 0 {
-		timeout = 60 * time.Second
+	// The timeout parameter from the handler is the long-poll wait duration.
+	// The job expiry must be independent — use a fixed 5-minute window so the
+	// worker has time to execute without the job being prematurely re-queued.
+	jobExpiry := 5 * time.Minute
+
+	// Look up the worker to get pool_id for scoped job claiming.
+	worker, err := s.repo.GetWorkerByID(ctx, s.db.Pool, workerID)
+	if err != nil {
+		s.logger.Error("claim job: worker lookup", "worker_id", workerID, "error", err)
+		return nil, err
 	}
 
-	// Try to claim an available job using SKIP LOCKED via the existing run job mechanics.
 	var job *Job
-	err := s.db.InTx(ctx, func(q db.DBTX) error {
-		runJob, err := s.runRepo.ClaimJob(ctx, q, workerID, timeout)
+	err = s.db.InTx(ctx, func(q db.DBTX) error {
+		runJob, err := s.runRepo.ClaimJob(ctx, q, workerID, jobExpiry, &worker.PoolID)
 		if err != nil {
 			return err
 		}

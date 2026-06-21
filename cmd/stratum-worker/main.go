@@ -29,6 +29,9 @@ func main() {
 	poolID := os.Getenv("STRATUM_POOL_ID")
 	hostname := os.Getenv("STRATUM_WORKER_HOSTNAME")
 	stateDir := os.Getenv("STRATUM_WORKER_STATE_DIR")
+	if stateDir == "" {
+		stateDir = "/tmp/stratum-worker"
+	}
 
 	if controlPlaneURL == "" {
 		fmt.Fprintln(os.Stderr, "STRATUM_CONTROL_PLANE_URL is required")

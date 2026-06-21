@@ -246,6 +246,9 @@ func (c *Client) GetSourceArchive(ctx context.Context, runID uuid.UUID) (io.Read
 	if err != nil {
 		return nil, err
 	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
