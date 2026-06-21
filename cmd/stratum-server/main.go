@@ -1,9 +1,6 @@
 // Command stratum-server is the Stratum control plane binary. It wires the
 // platform components (config, logger, telemetry, database, HTTP server) and
 // runs until it receives SIGINT or SIGTERM, then shuts down gracefully.
-//
-// Phase 0 serves only the health endpoint. The scheduler, reconciler, outbox
-// relay, and WebSocket hub are added in later phases.
 package main
 
 import (
@@ -27,6 +24,7 @@ import (
 	"github.com/yourorg/stratum/internal/stack"
 	"github.com/yourorg/stratum/internal/state"
 	"github.com/yourorg/stratum/internal/vcs"
+	"github.com/yourorg/stratum/internal/worker"
 )
 
 // Version and Commit are injected at build time via -ldflags.
@@ -38,8 +36,6 @@ var (
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		// Logger is not initialized yet; use the slog default to surface the
-		// configuration error as JSON on stdout.
 		slog.Error("config load failed", "error", err)
 		os.Exit(1)
 	}
@@ -53,11 +49,9 @@ func main() {
 		"http_port", cfg.HTTPPort,
 	)
 
-	// Surface shutdown signals as a cancelled context.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Telemetry: no-op tracer provider in Phase 0.
 	telemetryShutdown, err := telemetry.InitTracer(ctx)
 	if err != nil {
 		log.Error("telemetry init failed", "error", err)
@@ -71,7 +65,6 @@ func main() {
 		}
 	}()
 
-	// Database connection pool.
 	database, err := db.New(ctx, cfg.DBURL)
 	if err != nil {
 		log.Error("database init failed", "error", err)
@@ -80,7 +73,6 @@ func main() {
 	defer database.Close()
 	log.Info("database connected")
 
-	// Bounded-context services.
 	crypto, err := secret.NewCrypto(cfg.EncryptionKey)
 	if err != nil {
 		log.Error("secret crypto init failed", "error", err)
@@ -107,20 +99,24 @@ func main() {
 	)
 	go sched.Start(ctx)
 
+	// Phase 3: Worker runtime.
+	workerSvc := worker.NewService(database, runSvc, stackSvc, secretSvc, cfg.WorkerHMACSecret, log)
+
 	// HTTP server.
 	router := api.NewRouter(api.Deps{
-		IAMSvc:    iamSvc,
-		StackSvc:  stackSvc,
-		SecretSvc: secretSvc,
-		StateSvc:  stateSvc,
-		VCSSvc:    vcsSvc,
-		RunSvc:    runSvc,
-		WsHub:     wsHub,
-		Logger:    log,
+		IAMSvc:           iamSvc,
+		StackSvc:         stackSvc,
+		SecretSvc:        secretSvc,
+		StateSvc:         stateSvc,
+		VCSSvc:           vcsSvc,
+		RunSvc:           runSvc,
+		WorkerSvc:        workerSvc,
+		WorkerHMACSecret: cfg.WorkerHMACSecret,
+		WsHub:            wsHub,
+		Logger:           log,
 	})
 	srv := api.New(":"+cfg.HTTPPort, router, log)
 
-	// Run the server in a goroutine so the main goroutine can wait on signals.
 	serverErr := make(chan error, 1)
 	go func() {
 		serverErr <- srv.Start()

@@ -6,6 +6,7 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -14,6 +15,20 @@ import (
 	domainerr "github.com/yourorg/stratum/internal/platform/errors"
 	"github.com/yourorg/stratum/internal/stack"
 )
+
+// extractBearerToken pulls the value from an "Authorization: Bearer <token>"
+// header. Returns empty string when the header is missing or malformed.
+func extractBearerToken(r *http.Request) string {
+	hdr := r.Header.Get("Authorization")
+	if hdr == "" {
+		return ""
+	}
+	parts := strings.SplitN(hdr, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
+		return ""
+	}
+	return parts[1]
+}
 
 // identityFromRequest extracts the authenticated identity, writing 401 if it is
 // absent (e.g. the route is not behind the auth middleware).

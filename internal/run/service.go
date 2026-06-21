@@ -36,6 +36,8 @@ type RunService interface {
 	// Event store
 	AppendEvent(ctx context.Context, runID uuid.UUID, event RunEventInput) error
 	GetTimeline(ctx context.Context, runID uuid.UUID) ([]*RunEvent, error)
+	GetPlanOutput(ctx context.Context, runID uuid.UUID) (*PlanOutput, error)
+	StorePlanOutput(ctx context.Context, runID uuid.UUID, output *PlanOutput) error
 
 	// Logs
 	AppendLogs(ctx context.Context, runID uuid.UUID, lines []LogLine) error
@@ -263,6 +265,16 @@ func (s *service) AppendLogs(ctx context.Context, runID uuid.UUID, lines []LogLi
 
 func (s *service) GetLogs(ctx context.Context, runID uuid.UUID, page Pagination) ([]*LogLine, int, error) {
 	return s.repo.ListLogLines(ctx, s.db.Pool, runID, page)
+}
+
+// ─── Plan output ────────────────────────────────────────────────────────────
+
+func (s *service) GetPlanOutput(ctx context.Context, runID uuid.UUID) (*PlanOutput, error) {
+	return s.repo.GetPlanOutput(ctx, s.db.Pool, runID)
+}
+
+func (s *service) StorePlanOutput(ctx context.Context, runID uuid.UUID, output *PlanOutput) error {
+	return s.repo.StorePlanOutput(ctx, s.db.Pool, runID, output)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

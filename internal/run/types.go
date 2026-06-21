@@ -144,3 +144,21 @@ type Pagination struct {
 	Page int
 	Size int
 }
+
+// ─── Plan output ────────────────────────────────────────────────────────────
+
+// ResourceChange describes a single resource change in a plan.
+type ResourceChange struct {
+	Address string   `json:"address"`
+	Actions []string `json:"actions"` // ["create"] | ["update"] | ["delete"] | ["no-op"]
+}
+
+// PlanOutput is the structured result of a plan or drift_detect run.
+type PlanOutput struct {
+	Raw        []byte           `json:"raw"`
+	HasChanges bool             `json:"has_changes"`
+	Added      int              `json:"added"`
+	Changed    int              `json:"changed"`
+	Removed    int              `json:"removed"`
+	Resources  []ResourceChange `json:"resources"`
+}

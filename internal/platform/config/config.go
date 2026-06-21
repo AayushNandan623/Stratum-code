@@ -30,6 +30,9 @@ type Config struct {
 	// signatures. Phase 1 uses a single global secret; per-connection secrets
 	// arrive with the connection schema extension in a later phase.
 	WebhookSecret string
+	// WorkerHMACSecret is the HMAC key used to hash worker and pool tokens.
+	// Defaults to WebhookSecret if not explicitly set.
+	WorkerHMACSecret string
 }
 
 // Load reads configuration from the environment, applies defaults, and
@@ -37,13 +40,14 @@ type Config struct {
 // missing or a value is invalid.
 func Load() (Config, error) {
 	cfg := Config{
-		DBURL:         os.Getenv("STRATUM_DB_URL"),
-		HTTPPort:      getenvDefault("STRATUM_HTTP_PORT", "8080"),
-		LogLevel:      strings.ToLower(getenvDefault("STRATUM_LOG_LEVEL", "info")),
-		Env:           strings.ToLower(getenvDefault("STRATUM_ENV", "development")),
-		EncryptionKey: os.Getenv("STRATUM_ENCRYPTION_KEY"),
-		JWTSecret:     os.Getenv("STRATUM_JWT_SECRET"),
-		WebhookSecret: getenvDefault("STRATUM_WEBHOOK_SECRET", os.Getenv("STRATUM_WORKER_HMAC_SECRET")),
+		DBURL:            os.Getenv("STRATUM_DB_URL"),
+		HTTPPort:         getenvDefault("STRATUM_HTTP_PORT", "8080"),
+		LogLevel:         strings.ToLower(getenvDefault("STRATUM_LOG_LEVEL", "info")),
+		Env:              strings.ToLower(getenvDefault("STRATUM_ENV", "development")),
+		EncryptionKey:    os.Getenv("STRATUM_ENCRYPTION_KEY"),
+		JWTSecret:        os.Getenv("STRATUM_JWT_SECRET"),
+		WebhookSecret:    getenvDefault("STRATUM_WEBHOOK_SECRET", os.Getenv("STRATUM_WORKER_HMAC_SECRET")),
+		WorkerHMACSecret: getenvDefault("STRATUM_WORKER_HMAC_SECRET", os.Getenv("STRATUM_WEBHOOK_SECRET")),
 	}
 
 	if err := cfg.validate(); err != nil {

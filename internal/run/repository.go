@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -455,6 +456,46 @@ func (r *Repository) ListLogLines(ctx context.Context, pool *pgxpool.Pool, runID
 		return nil, 0, err
 	}
 	return out, total, nil
+}
+
+// ─── Plan outputs ───────────────────────────────────────────────────────────
+
+// StorePlanOutput saves or updates the plan output JSONB for a run.
+func (r *Repository) StorePlanOutput(ctx context.Context, q db.DBTX, runID uuid.UUID, output *PlanOutput) error {
+	raw, err := json.Marshal(output)
+	if err != nil {
+		return err
+	}
+	const sql = `UPDATE runs SET plan_output = $2, updated_at = now() WHERE id = $1`
+	tag, err := q.Exec(ctx, sql, runID, raw)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrRunNotFound
+	}
+	return nil
+}
+
+// GetPlanOutput retrieves the stored plan output for a run.
+func (r *Repository) GetPlanOutput(ctx context.Context, pool *pgxpool.Pool, runID uuid.UUID) (*PlanOutput, error) {
+	const sql = `SELECT plan_output FROM runs WHERE id = $1`
+	var raw []byte
+	err := pool.QueryRow(ctx, sql, runID).Scan(&raw)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrRunNotFound
+		}
+		return nil, err
+	}
+	if raw == nil {
+		return nil, nil
+	}
+	var out PlanOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // ─── Sentinel errors ────────────────────────────────────────────────────────
