@@ -33,6 +33,15 @@ type Config struct {
 	// WorkerHMACSecret is the HMAC key used to hash worker and pool tokens.
 	// Defaults to WebhookSecret if not explicitly set.
 	WorkerHMACSecret string
+	// NATSUrl is the NATS server URL (Phase 6+).
+	NATSUrl string
+	// SlackWebhookURL is the Slack webhook URL for notifications (Phase 6+).
+	// Empty string disables Slack notifications.
+	SlackWebhookURL string
+	// OutboxTickMs is the poll interval for the outbox relay in milliseconds.
+	OutboxTickMs int
+	// OutboxBatchSize is the maximum messages per outbox flush.
+	OutboxBatchSize int
 }
 
 // Load reads configuration from the environment, applies defaults, and
@@ -48,6 +57,10 @@ func Load() (Config, error) {
 		JWTSecret:        os.Getenv("STRATUM_JWT_SECRET"),
 		WebhookSecret:    getenvDefault("STRATUM_WEBHOOK_SECRET", os.Getenv("STRATUM_WORKER_HMAC_SECRET")),
 		WorkerHMACSecret: getenvDefault("STRATUM_WORKER_HMAC_SECRET", os.Getenv("STRATUM_WEBHOOK_SECRET")),
+		NATSUrl:          getenvDefault("STRATUM_NATS_URL", "nats://localhost:4222"),
+		SlackWebhookURL:  os.Getenv("STRATUM_SLACK_WEBHOOK_URL"),
+		OutboxTickMs:     getenvIntDefault("STRATUM_OUTBOX_TICK_MS", 500),
+		OutboxBatchSize:  getenvIntDefault("STRATUM_OUTBOX_BATCH_SIZE", 50),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -84,6 +97,9 @@ func (c Config) validate() error {
 	if c.WebhookSecret == "" {
 		return fmt.Errorf("config: STRATUM_WEBHOOK_SECRET (or STRATUM_WORKER_HMAC_SECRET) is required")
 	}
+	if c.NATSUrl == "" {
+		return fmt.Errorf("config: STRATUM_NATS_URL is required")
+	}
 	return nil
 }
 
@@ -92,6 +108,18 @@ func (c Config) validate() error {
 func getenvDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+// getenvIntDefault reads an integer from the environment, returning fallback
+// on parse failure.
+func getenvIntDefault(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		n, err := strconv.Atoi(v)
+		if err == nil {
+			return n
+		}
 	}
 	return fallback
 }

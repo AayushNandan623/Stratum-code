@@ -1,6 +1,6 @@
 // Command stratum-server is the Stratum control plane binary. It wires the
-// platform components (config, logger, telemetry, database, HTTP server) and
-// runs until it receives SIGINT or SIGTERM, then shuts down gracefully.
+// platform components (config, logger, telemetry, database, NATS, HTTP server)
+// and runs until it receives SIGINT or SIGTERM, then shuts down gracefully.
 package main
 
 import (
@@ -13,6 +13,8 @@ import (
 
 	"github.com/yourorg/stratum/internal/api"
 	"github.com/yourorg/stratum/internal/api/ws"
+	"github.com/yourorg/stratum/internal/events"
+	"github.com/yourorg/stratum/internal/events/consumers"
 	"github.com/yourorg/stratum/internal/iam"
 	"github.com/yourorg/stratum/internal/platform/clock"
 	"github.com/yourorg/stratum/internal/platform/config"
@@ -75,6 +77,15 @@ func main() {
 	defer database.Close()
 	log.Info("database connected")
 
+	// Phase 6: NATS connection.
+	natsBus, err := events.NewNATSBus(ctx, cfg.NATSUrl, log)
+	if err != nil {
+		log.Error("nats init failed", "error", err)
+		os.Exit(1)
+	}
+	js := natsBus.JetStream()
+	log.Info("nats connected", "url", cfg.NATSUrl)
+
 	crypto, err := secret.NewCrypto(cfg.EncryptionKey)
 	if err != nil {
 		log.Error("secret crypto init failed", "error", err)
@@ -92,8 +103,9 @@ func main() {
 	go bundleLoader.Start(ctx)
 	policySvc := policy.NewService(database, bundleLoader, log)
 
-	// Phase 2: Run orchestration.
-	wsHub := ws.NewHub()
+	// Phase 2: Run orchestration. Pass nil for hub (NATS handles distribution).
+	wsHub := ws.NewNATSHub(js)
+	wsHub.WithLogger(log)
 	runSvc := run.NewService(database, wsHub, log)
 
 	// Phase 5: Reconciler (needs runSvc; then sets itself as run's drift handler).
@@ -117,7 +129,35 @@ func main() {
 	// Phase 3: Worker runtime.
 	workerSvc := worker.NewService(database, runSvc, stackSvc, secretSvc, cfg.WorkerHMACSecret, log)
 
-	// HTTP server.
+	// Phase 6: Start outbox relay.
+	outboxRelay := events.NewOutboxRelay(database.Pool, js, log).
+		WithTick(time.Duration(cfg.OutboxTickMs) * time.Millisecond).
+		WithBatch(cfg.OutboxBatchSize)
+	go outboxRelay.Start(ctx)
+
+	// Phase 6: Start NATS consumers.
+	auditArchiver := consumers.NewAuditArchiver(database.Pool, js, log)
+	go func() {
+		if err := auditArchiver.Start(ctx); err != nil {
+			log.Error("audit archiver exited", "error", err)
+		}
+	}()
+
+	notifyRouter := consumers.NewNotificationRouter(js, cfg.SlackWebhookURL, log)
+	go func() {
+		if err := notifyRouter.Start(ctx); err != nil {
+			log.Error("notification router exited", "error", err)
+		}
+	}()
+
+	reconcileTrigger := consumers.NewReconcileTriggerConsumer(reconcileSvc, js, log)
+	go func() {
+		if err := reconcileTrigger.Start(ctx); err != nil {
+			log.Error("reconcile trigger consumer exited", "error", err)
+		}
+	}()
+
+	// HTTP server — pass NATS hub.
 	router := api.NewRouter(api.Deps{
 		IAMSvc:           iamSvc,
 		StackSvc:         stackSvc,

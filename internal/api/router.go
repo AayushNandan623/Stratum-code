@@ -34,7 +34,7 @@ type Deps struct {
 	RunSvc           run.RunService
 	WorkerSvc        worker.WorkerService
 	WorkerHMACSecret string // HMAC secret for worker token validation
-	WsHub            *ws.Hub
+	WsHub            *ws.NATSHub
 	Logger           *slog.Logger
 }
 

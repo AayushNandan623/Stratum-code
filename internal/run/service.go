@@ -9,13 +9,14 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/yourorg/stratum/internal/events"
 	"github.com/yourorg/stratum/internal/platform/db"
 	domainerr "github.com/yourorg/stratum/internal/platform/errors"
 )
 
 // EventPublisher is the interface for publishing run events to subscribers
-// (WebSocket hub in Phase 2, NATS in Phase 6). Defined here to avoid importing
-// the API layer from the run context.
+// (WebSocket hub in Phase 2, NATS in Phase 6). In Phase 6 this is a no-op;
+// events are distributed via the transactional outbox and NATS.
 type EventPublisher interface {
 	PublishRunEvent(runID string, data []byte)
 }
@@ -60,7 +61,7 @@ type service struct {
 	events       *EventStore
 	sm           *StateMachine
 	db           *db.DB
-	hub          EventPublisher // optional — nil is safe
+	hub          EventPublisher // optional — no-op in Phase 6
 	driftHandler DriftHandler   // optional — nil is safe (set in Phase 5)
 	logger       *slog.Logger
 }
@@ -116,7 +117,7 @@ func (s *service) Create(ctx context.Context, input CreateRunInput) (*Run, error
 		if err := s.repo.Create(ctx, q, run); err != nil {
 			return err
 		}
-		ev, err := s.events.Append(ctx, q, AppendEventInput{
+		return s.appendRunEventAndOutbox(ctx, q, run.ID, run.OrgID, run.StackID, AppendEventInput{
 			RunID:      run.ID,
 			OrgID:      run.OrgID,
 			EventType:  "run.created",
@@ -125,11 +126,6 @@ func (s *service) Create(ctx context.Context, input CreateRunInput) (*Run, error
 			Payload:    marshalMeta(map[string]string{"run_type": string(input.RunType), "trigger_type": string(input.TriggerType)}),
 			OccurredAt: now,
 		})
-		if err != nil {
-			return err
-		}
-		s.broadcastEvent(run.ID.String(), ev)
-		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -159,9 +155,6 @@ func (s *service) Cancel(ctx context.Context, id uuid.UUID, actorID uuid.UUID) e
 // ─── Approve ────────────────────────────────────────────────────────────────
 
 func (s *service) Approve(ctx context.Context, id uuid.UUID, actorID uuid.UUID) error {
-	// TODO(phase-4): Policy evaluation gate. Phase 4 replaces this with a call
-	// to policySvc.Evaluate() and transitions to StatePolicyRejected on deny.
-	// For now, always allow.
 	payload, _ := json.Marshal(map[string]string{"actor_id": actorID.String(), "source": "approval"})
 	return s.transitionWithActor(ctx, id, StateApplying, actorID, "user", payload)
 }
@@ -191,21 +184,18 @@ func (s *service) Transition(ctx context.Context, id uuid.UUID, to RunState, met
 			return err
 		}
 		eventType := stateToEventType(to)
-		payload := marshalMeta(meta)
-		ev, err := s.events.Append(ctx, q, AppendEventInput{
+		if err := s.appendRunEventAndOutbox(ctx, q, id, run.OrgID, run.StackID, AppendEventInput{
 			RunID:      id,
 			OrgID:      run.OrgID,
 			EventType:  eventType,
-			Payload:    payload,
+			Payload:    marshalMeta(meta),
 			OccurredAt: time.Now(),
-		})
-		if err != nil {
+		}); err != nil {
 			return err
 		}
 		if err := s.repo.UpdateState(ctx, q, id, to); err != nil {
 			return err
 		}
-		s.broadcastEvent(id.String(), ev)
 		runData.OrgID = run.OrgID
 		runData.StackID = run.StackID
 		runData.RunType = run.RunType
@@ -254,23 +244,20 @@ func (s *service) transitionWithActor(ctx context.Context, id uuid.UUID, to RunS
 		if err := s.sm.Transition(run.CurrentState, to); err != nil {
 			return err
 		}
-		eventType := stateToEventType(to)
-		ev, err := s.events.Append(ctx, q, AppendEventInput{
+		if err := s.appendRunEventAndOutbox(ctx, q, id, run.OrgID, run.StackID, AppendEventInput{
 			RunID:      id,
 			OrgID:      run.OrgID,
-			EventType:  eventType,
+			EventType:  stateToEventType(to),
 			ActorID:    &actorID,
 			ActorType:  actorType,
 			Payload:    payload,
 			OccurredAt: time.Now(),
-		})
-		if err != nil {
+		}); err != nil {
 			return err
 		}
 		if err := s.repo.UpdateState(ctx, q, id, to); err != nil {
 			return err
 		}
-		s.broadcastEvent(id.String(), ev)
 		return nil
 	})
 }
@@ -289,7 +276,7 @@ func (s *service) AppendEvent(ctx context.Context, runID uuid.UUID, input RunEve
 		if err != nil {
 			return err
 		}
-		ev, err := s.events.Append(ctx, q, AppendEventInput{
+		return s.appendRunEventAndOutbox(ctx, q, runID, run.OrgID, run.StackID, AppendEventInput{
 			RunID:      runID,
 			OrgID:      run.OrgID,
 			EventType:  input.EventType,
@@ -298,11 +285,6 @@ func (s *service) AppendEvent(ctx context.Context, runID uuid.UUID, input RunEve
 			Payload:    input.Payload,
 			OccurredAt: input.OccurredAt,
 		})
-		if err != nil {
-			return err
-		}
-		s.broadcastEvent(runID.String(), ev)
-		return nil
 	})
 }
 
@@ -313,8 +295,6 @@ func (s *service) GetTimeline(ctx context.Context, runID uuid.UUID) ([]*RunEvent
 // ─── Logs ───────────────────────────────────────────────────────────────────
 
 func (s *service) AppendLogs(ctx context.Context, runID uuid.UUID, lines []LogLine) error {
-	// For simplicity, we use the pool directly (no transaction needed for
-	// log ingestion — best-effort is acceptable).
 	_, err := s.repo.InsertLogLines(ctx, s.db.Pool, runID, lines)
 	return err
 }
@@ -341,6 +321,53 @@ func (s *service) SetDriftHandler(h DriftHandler) {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+// appendRunEventAndOutbox appends a run event AND writes outbox messages within
+// the same transaction. This is the Phase 6 transactional outbox pattern:
+// the DB event insert and outbox message are atomically committed together.
+func (s *service) appendRunEventAndOutbox(ctx context.Context, q db.DBTX, runID, orgID, stackID uuid.UUID, input AppendEventInput) error {
+	ev, err := s.events.Append(ctx, q, input)
+	if err != nil {
+		return err
+	}
+
+	// Phase 6: write run event to outbox (subject: stratum.runs.events.{run_id}).
+	runEventMsg := events.RunEventMessage{
+		EventID:    ev.ID,
+		RunID:      ev.RunID,
+		OrgID:      ev.OrgID,
+		StackID:    stackID,
+		Seq:        ev.Seq,
+		EventType:  ev.EventType,
+		ActorID:    ev.ActorID,
+		ActorType:  ev.ActorType,
+		Payload:    ev.Payload,
+		OccurredAt: ev.OccurredAt,
+	}
+	if err := events.InsertOutboxMessage(ctx, q, fmt.Sprintf("stratum.runs.events.%s", runID), runEventMsg); err != nil {
+		return err
+	}
+
+	// Phase 6: also write an audit event (subject: stratum.audit.{org_id}).
+	auditMsg := events.AuditEventMessage{
+		ID:           ev.ID,
+		OrgID:        orgID,
+		ActorID:      ev.ActorID,
+		ActorType:    actorTypeForAudit(ev.ActorType),
+		Action:       ev.EventType,
+		ResourceType: "run",
+		ResourceID:   &runID,
+		Metadata:     ev.Payload,
+		OccurredAt:   ev.OccurredAt,
+	}
+	if err := events.InsertOutboxMessage(ctx, q, fmt.Sprintf("stratum.audit.%s", orgID), auditMsg); err != nil {
+		return err
+	}
+
+	// Phase 2 backward compat: also broadcast to in-memory hub (no-op in Phase 6).
+	s.broadcastEvent(runID.String(), ev)
+	return nil
+}
 
 // stateToEventType maps a state to the event type string stored in run_events.
 func stateToEventType(s RunState) string {
@@ -380,6 +407,18 @@ func actorType(actorID *uuid.UUID) string {
 		return "user"
 	}
 	return "system"
+}
+
+// actorTypeForAudit converts an internal actor type to the audit_log format.
+func actorTypeForAudit(t string) string {
+	switch t {
+	case "user":
+		return "USER"
+	case "system":
+		return "SYSTEM"
+	default:
+		return "SYSTEM"
+	}
 }
 
 // marshalMeta converts arbitrary metadata to JSON. Returns "{}" on failure.

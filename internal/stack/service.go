@@ -4,10 +4,13 @@ package stack
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/yourorg/stratum/internal/events"
 	"github.com/yourorg/stratum/internal/platform/db"
 	domainerr "github.com/yourorg/stratum/internal/platform/errors"
 )
@@ -62,6 +65,38 @@ func (s *service) Create(ctx context.Context, in CreateStackInput) (*Stack, erro
 			in.ReconcileInterval.Seconds(), firstCheckDelay); err != nil {
 			return err
 		}
+		// Phase 6: write stack.created event to outbox.
+		now := time.Now()
+		eventID := uuid.New()
+		stackMsg := events.StackEventMessage{
+			EventID:    eventID,
+			StackID:    stk.ID,
+			OrgID:      stk.OrgID,
+			EventType:  "stack.created",
+			ActorID:    nil,
+			ActorType:  "system",
+			Payload:    mustMarshal(in),
+			OccurredAt: now,
+		}
+		if err := events.InsertOutboxMessage(ctx, q,
+			fmt.Sprintf("stratum.stacks.events.%s", stk.ID), stackMsg); err != nil {
+			return err
+		}
+		// Write audit event.
+		auditMsg := events.AuditEventMessage{
+			ID:           eventID,
+			OrgID:        stk.OrgID,
+			ActorType:    "SYSTEM",
+			Action:       "stack.created",
+			ResourceType: "stack",
+			ResourceID:   &stk.ID,
+			Metadata:     mustMarshal(map[string]string{"name": stk.Name}),
+			OccurredAt:   now,
+		}
+		if err := events.InsertOutboxMessage(ctx, q,
+			fmt.Sprintf("stratum.audit.%s", stk.OrgID), auditMsg); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -79,7 +114,62 @@ func (s *service) GetByOrgID(ctx context.Context, orgID uuid.UUID, page Paginati
 }
 
 func (s *service) Update(ctx context.Context, orgID, id uuid.UUID, in UpdateStackInput) (*Stack, error) {
-	return s.repo.Update(ctx, s.db.Pool, orgID, id, in)
+	var stk *Stack
+	err := s.db.InTx(ctx, func(q db.DBTX) error {
+		var err error
+		stk, err = s.repo.Update(ctx, q, orgID, id, in)
+		if err != nil {
+			return err
+		}
+		// Phase 6: write stack.updated event.
+		now := time.Now()
+		eventID := uuid.New()
+		eventType := "stack.updated"
+		// If key config fields changed, mark as config_updated for reconcile trigger.
+		if in.VCSRepo != nil || in.VCSBranch != nil || in.WorkingDir != nil {
+			eventType = "stack.config_updated"
+		}
+		stackMsg := events.StackEventMessage{
+			EventID:    eventID,
+			StackID:    stk.ID,
+			OrgID:      stk.OrgID,
+			EventType:  eventType,
+			ActorType:  "system",
+			Payload:    mustMarshal(in),
+			OccurredAt: now,
+		}
+		if err := events.InsertOutboxMessage(ctx, q,
+			fmt.Sprintf("stratum.stacks.events.%s", stk.ID), stackMsg); err != nil {
+			return err
+		}
+		// Also publish to reconcile trigger subject for immediate drift-detect.
+		if eventType == "stack.config_updated" {
+			if err := events.InsertOutboxMessage(ctx, q,
+				fmt.Sprintf("stratum.reconcile.trigger.%s", stk.ID), stackMsg); err != nil {
+				return err
+			}
+		}
+		// Write audit event.
+		auditMsg := events.AuditEventMessage{
+			ID:           eventID,
+			OrgID:        stk.OrgID,
+			ActorType:    "SYSTEM",
+			Action:       eventType,
+			ResourceType: "stack",
+			ResourceID:   &stk.ID,
+			Metadata:     mustMarshal(in),
+			OccurredAt:   now,
+		}
+		if err := events.InsertOutboxMessage(ctx, q,
+			fmt.Sprintf("stratum.audit.%s", stk.OrgID), auditMsg); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return stk, nil
 }
 
 func (s *service) Delete(ctx context.Context, orgID, id uuid.UUID) error {
@@ -189,4 +279,13 @@ func (s *service) GetUpstreamStatus(_ context.Context, _ uuid.UUID) ([]UpstreamS
 // for the webhook receiver).
 func (s *service) ListByVCS(ctx context.Context, repo, branch string) ([]*Stack, error) {
 	return s.repo.ListByVCS(ctx, s.db.Pool, repo, branch)
+}
+
+// mustMarshal serialises v to JSON or returns "{}".
+func mustMarshal(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return json.RawMessage(b)
 }

@@ -18,12 +18,12 @@ import (
 // RunsHandler exposes run lifecycle endpoints and event streaming.
 type RunsHandler struct {
 	svc    run.RunService
-	hub    *ws.Hub
+	hub    *ws.NATSHub
 	logger *slog.Logger
 }
 
 // NewRunsHandler constructs a RunsHandler.
-func NewRunsHandler(svc run.RunService, hub *ws.Hub, logger *slog.Logger) *RunsHandler {
+func NewRunsHandler(svc run.RunService, hub *ws.NATSHub, logger *slog.Logger) *RunsHandler {
 	return &RunsHandler{svc: svc, hub: hub, logger: logger}
 }
 
@@ -269,8 +269,9 @@ func (h *RunsHandler) GetLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 // EventStream handles the WS /api/v1/runs/{run_id}/events/stream endpoint.
-// It upgrades the connection to WebSocket and forwards run events as they are
-// published by the hub.
+// It upgrades the connection to WebSocket and forwards run events as they
+// arrive via NATS. Historical events are served through the REST timeline
+// endpoint (GET /api/v1/runs/{run_id}/timeline) at connect time.
 func (h *RunsHandler) EventStream(w http.ResponseWriter, r *http.Request) {
 	runID, ok := parseUUID(w, r, "run_id")
 	if !ok {
@@ -296,28 +297,35 @@ func (h *RunsHandler) EventStream(w http.ResponseWriter, r *http.Request) {
 		h.logger.Error("ws upgrade failed", "run_id", runID, "error", err)
 		return
 	}
+
+	cleanup, err := h.hub.SubscribeToRun(r.Context(), runID, func(data []byte) {
+		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			h.logger.Debug("ws write error", "run_id", runID, "error", err)
+		}
+	})
+	if err != nil {
+		h.logger.Error("nats subscribe failed", "run_id", runID, "error", err)
+		conn.Close()
+		return
+	}
+	defer cleanup()
 	defer conn.Close()
 
-	ch, unsub := h.hub.Subscribe(runID.String())
-	defer unsub()
-
-	conn.SetCloseHandler(func(code int, text string) error {
-		return nil
-	})
-
-	for {
-		select {
-		case msg, ok := <-ch:
-			if !ok {
+	// Read pump detects client disconnect. Exit when the connection closes.
+	readErr := make(chan error, 1)
+	go func() {
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				readErr <- err
 				return
 			}
-			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-				h.logger.Debug("ws write error", "run_id", runID, "error", err)
-				return
-			}
-		case <-r.Context().Done():
-			return
 		}
+	}()
+
+	// Wait for either client disconnect (read error) or context cancel.
+	select {
+	case <-readErr:
+	case <-r.Context().Done():
 	}
 }
 
